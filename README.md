@@ -101,14 +101,21 @@ PyPI 的 1.13.8 装完，扩展模块里**没有** `offline-paraformer-model-rkn
 
 ### 办法一：用编好的轮子（推荐，省 25 分钟）
 
-`dist/` 里带了一个已经编好、**验证过能跑**的（15 MB）：
+把轮子（15 MB）放进 `dist/` 目录就行，`install.sh` 会自己发现它。
+也可以显式指定 —— 本地路径或网址都行：
 
 ```bash
-VOCOTYPE_NPU_WHEEL=dist/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_aarch64.whl \
+# 本地文件
+VOCOTYPE_NPU_WHEEL=/path/to/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_aarch64.whl \
+    ./install.sh
+
+# 或者一个网址（会下载并缓存到 ~/.cache/vocotype-npu/）
+VOCOTYPE_NPU_WHEEL=https://github.com/<用户名>/vocotype-npu/releases/download/v1.0.0/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_aarch64.whl \
     ./install.sh
 ```
 
 要求 **aarch64 + Python 3.11**。细节和来历见 `dist/README.md`。
+（轮子没跟着代码走 —— 它在 `.gitignore` 里，一般挂在 Releases 附件上。）
 
 ### 办法二：自己编（约 25 分钟，本机验证过）
 

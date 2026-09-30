@@ -180,6 +180,26 @@ fi
 if has_rknn_sherpa; then
     say "  已装好，跳过"
 elif [ "$DO_BUILD_SHERPA" = 0 ] && [ -n "$WHEEL" ]; then
+    # 轮子也可以直接从 URL 拿（发布方把轮子挂在 GitHub Release 上，
+    # 仓库本身就不用背那 15 MB）。只有真要装的时候才下，不白费流量。
+    case "$WHEEL" in
+        http://*|https://*)
+            say "  下载轮子：$(basename "$WHEEL")"
+            WHEEL_FILE="$HOME/.cache/vocotype-npu/$(basename "$WHEEL")"
+            mkdir -p "$(dirname "$WHEEL_FILE")"
+            if [ -f "$WHEEL_FILE" ]; then
+                say "  本地已有缓存，跳过下载"
+            elif command -v curl >/dev/null 2>&1; then
+                curl -fL --progress-bar -o "$WHEEL_FILE" "$WHEEL" || die "下载失败：$WHEEL"
+            elif command -v wget >/dev/null 2>&1; then
+                wget -O "$WHEEL_FILE" "$WHEEL" || die "下载失败：$WHEEL"
+            else
+                die "从 URL 下轮子需要 curl 或 wget，两个都没有。
+     手动下载后：VOCOTYPE_NPU_WHEEL=/路径/sherpa_onnx-*.whl ./install.sh"
+            fi
+            WHEEL="$WHEEL_FILE"
+            ;;
+    esac
     say "  用预编译轮子：$(basename "$WHEEL")"
     "$VENV/bin/python3" -m pip install --quiet "$WHEEL" \
         || die "装 $WHEEL 失败（架构/Python 版本对得上吗？看 dist/README.md）"
@@ -209,6 +229,7 @@ else
   1) 用编好的轮子（最省事，省 25 分钟）：
          把 wheel 放到 dist/ 目录下，再跑一次 ./install.sh
      或者   VOCOTYPE_NPU_WHEEL=/path/to/sherpa_onnx-*.whl ./install.sh
+     或者   VOCOTYPE_NPU_WHEEL=https://.../sherpa_onnx-*.whl ./install.sh
      dist/README.md 里有适用条件和来历。
 
   2) 让本脚本从源码编（约 25 分钟，本机验证过）：

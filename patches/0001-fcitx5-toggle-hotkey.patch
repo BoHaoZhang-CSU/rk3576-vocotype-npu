@@ -1,0 +1,150 @@
+diff --git a/src/integrations/fcitx5/module/vocotype_module.cpp b/src/integrations/fcitx5/module/vocotype_module.cpp
+index d61cb69..730ca50 100644
+--- a/src/integrations/fcitx5/module/vocotype_module.cpp
++++ b/src/integrations/fcitx5/module/vocotype_module.cpp
+@@ -58,6 +58,10 @@ namespace {
+ constexpr auto FCITX_CONFIG_PATH = "conf/vocotype.conf";
+ constexpr uint64_t RECORDING_ANIMATION_INTERVAL_US = 200000;
+ constexpr uint64_t PTT_AUTOREPEAT_RELEASE_GRACE_US = 30000;
++// 「按一下切换」模式下，刚开录时收到的连发按下都当自动重复丢掉。部分前端
++// 会把「按住不放」报成 press/release 反复，不挡的话按久一点就立刻停录了。
++// 比最短录音时长（1000ms）小，正常的「按一下停」不会受影响。
++constexpr uint64_t TOGGLE_STOP_DEBOUNCE_US = 400000;
+ constexpr uint64_t POLISH_POLL_INTERVAL_US = 100000;
+ constexpr uint64_t FINAL_ASR_WATCHDOG_US = 120000000;
+ constexpr uint64_t DUPLICATE_COMMIT_SUPPRESS_US = 250000;
+@@ -887,9 +891,11 @@ void VoCoTypeModule::handleKeyEvent(fcitx::KeyEvent &event) {
+     }
+ 
+   if (event.isRelease()) {
+-    if ((is_recording_ || ptt_pressed_) &&
+-        hotkeyReleaseMatches(key, active_hotkey_)) {
+-      armPendingPttRelease(ic);
++    // 改成「按一下切换」后，松开不再结束录音。但抬起事件仍然吃掉，免得
++    // 应用只收到抬起、收不到按下（按下那一下在下面已经被吃掉了）。
++    if (hotkeyReleaseMatches(key, transcribe_key_) ||
++        hotkeyReleaseMatches(key, polish_key_) ||
++        hotkeyReleaseMatches(key, edit_key_)) {
+       event.filterAndAccept();
+     }
+         return;
+@@ -914,38 +920,54 @@ void VoCoTypeModule::handleKeyEvent(fcitx::KeyEvent &event) {
+             event.filterAndAccept();
+             return;
+         }
+-        if (!is_recording_ && !ptt_pressed_) {
+-            if (block_when_composing_ && hasActiveComposition(ic)) {
+-      FCITX_INFO() << "VoCoType hotkey ignored because current input method "
+-                      "has active composition";
+-                event.filterAndAccept();
++        // 「按一下切换」：正在录音时，这一次按下就是「停止」。
++        if (is_recording_) {
++            const uint64_t now_us = fcitx::now(CLOCK_MONOTONIC);
++            if (recording_started_us_ > 0 && now_us >= recording_started_us_ &&
++                now_us - recording_started_us_ < TOGGLE_STOP_DEBOUNCE_US) {
++                event.filterAndAccept();  // 自动重复，不是真的要停
+                 return;
+             }
+-    const bool edit_mode = mode == VoiceHotkeyMode::Edit;
+-            VoiceEditSnapshot edit_snapshot;
+-            if (edit_mode) {
+-                std::string error;
+-                if (!captureVoiceEditSnapshot(ic, edit_snapshot, error)) {
+-        editDebugLog(
+-            "native_snapshot_unavailable program=" + ic->program() +
+-            " frontend=" + std::string(ic->frontend() ? ic->frontend() : "") +
+-            " flags=" + std::to_string(ic->capabilityFlags().toInteger()) +
+-                                 " reason=" + error);
+-        showError(ic, error.empty() ? "当前输入框未通过输入法接口提供上下文"
+-                                  : error);
+-                    event.filterAndAccept();
+-                    return;
+-                }
+-            }
+-            if (edit_mode && edit_snapshot.valid) {
+-                editDebugLog("native_snapshot program=" + ic->program() +
+-                             " bytes=" + std::to_string(edit_snapshot.text.size()) +
+-                             " text=" + debugClip(edit_snapshot.text));
++            stopAndTranscribe();
++            event.filterAndAccept();
++            return;
++        }
++        if (ptt_pressed_) {
++            // 上一次按下的状态没清掉（录音器被别的实例占用、长按那一档没走完
++            // 等），先复位再重新开始，否则会一直卡在这里起不来。
++            cancelPendingRecordingStart();
++        }
++
++        if (block_when_composing_ && hasActiveComposition(ic)) {
++            FCITX_INFO() << "VoCoType hotkey ignored because current input method "
++                            "has active composition";
++            event.filterAndAccept();
++            return;
++        }
++        const bool edit_mode = mode == VoiceHotkeyMode::Edit;
++        VoiceEditSnapshot edit_snapshot;
++        if (edit_mode) {
++            std::string error;
++            if (!captureVoiceEditSnapshot(ic, edit_snapshot, error)) {
++                editDebugLog(
++                    "native_snapshot_unavailable program=" + ic->program() +
++                    " frontend=" + std::string(ic->frontend() ? ic->frontend() : "") +
++                    " flags=" + std::to_string(ic->capabilityFlags().toInteger()) +
++                    " reason=" + error);
++                showError(ic, error.empty() ? "当前输入框未通过输入法接口提供上下文"
++                                            : error);
++                event.filterAndAccept();
++                return;
+             }
+-            active_ic_ = ic->watch();
+-    armPendingRecordingStart(ic, mode == VoiceHotkeyMode::Polish, edit_mode,
+-                             edit_snapshot, key, configured_hotkey);
+         }
++        if (edit_mode && edit_snapshot.valid) {
++            editDebugLog("native_snapshot program=" + ic->program() +
++                         " bytes=" + std::to_string(edit_snapshot.text.size()) +
++                         " text=" + debugClip(edit_snapshot.text));
++        }
++        active_ic_ = ic->watch();
++        armPendingRecordingStart(ic, mode == VoiceHotkeyMode::Polish, edit_mode,
++                                 edit_snapshot, key, configured_hotkey);
+ 
+     event.filterAndAccept();
+ }
+@@ -1268,7 +1290,7 @@ void VoCoTypeModule::startRecording(fcitx::InputContext *ic, bool long_mode,
+     }
+     if (edit_mode) {
+     showVoiceEditStatusBar(ic, "🎤 语音编辑中...",
+-                               "松开按键后识别编辑指令");
++                               "再按一次结束，识别编辑指令");
+     } else if (ultra_minimal_panel_) {
+     startPanelAnimation(ic, PanelAnimationKind::UltraMinimalRecording);
+     } else if (animate_panel_) {
+diff --git a/src/integrations/fcitx5/module/vocotype_module.h b/src/integrations/fcitx5/module/vocotype_module.h
+index aafbb5b..3a9e015 100644
+--- a/src/integrations/fcitx5/module/vocotype_module.h
++++ b/src/integrations/fcitx5/module/vocotype_module.h
+@@ -53,19 +53,20 @@ FCITX_CONFIGURATION(
+         this, "SettingsCenter", "打开 VoCoType 完整设置",
+         "vocotype-settings"};
+     fcitx::HiddenOption<fcitx::Key, fcitx::KeyConstrain> pttKey{
+-        this, "PTTKey", "按住说话主键", fcitx::Key(FcitxKey_F9),
++        this, "PTTKey", "语音输入主键（按一下开始，再按一下结束）",
++        fcitx::Key(FcitxKey_F9),
+         fcitx::KeyConstrain({fcitx::KeyConstrainFlag::AllowModifierLess,
+                              fcitx::KeyConstrainFlag::AllowModifierOnly})};
+     fcitx::HiddenOption<int, fcitx::IntConstrain> pttHoldThresholdMs{
+         this, "PTTHoldThresholdMs", "开始录音所需长按阈值（毫秒）", 0,
+         fcitx::IntConstrain(0, 2000)};
+     fcitx::HiddenOption<fcitx::Key, fcitx::KeyConstrain> polishKey{
+-        this, "PolishKey", "按住说话并进行 AI 润色",
++        this, "PolishKey", "语音输入并 AI 润色（按一下开始，再按一下结束）",
+         fcitx::Key(FcitxKey_F9, fcitx::KeyState::Shift),
+         fcitx::KeyConstrain({fcitx::KeyConstrainFlag::AllowModifierLess,
+                              fcitx::KeyConstrainFlag::AllowModifierOnly})};
+     fcitx::HiddenOption<fcitx::Key, fcitx::KeyConstrain> editKey{
+-        this, "EditKey", "按住说话并执行语音编辑",
++        this, "EditKey", "语音编辑（按一下开始，再按一下结束）",
+         fcitx::Key(FcitxKey_F9, fcitx::KeyState::Ctrl),
+         fcitx::KeyConstrain({fcitx::KeyConstrainFlag::AllowModifierLess,
+                              fcitx::KeyConstrainFlag::AllowModifierOnly})};

@@ -1,0 +1,18 @@
+# 本机环境，别提交（几百 MB，而且是平台/机器相关的）
+.venv/
+__pycache__/
+*.pyc
+
+# 模型：1.0 GB，跑 install.sh 下载，不进仓库
+models/
+*.rknn
+*.tar.bz2
+
+# 本机配置和测试产物
+npu.json
+*.log
+*.wav
+
+# 预编译的轮子：15 MB，属于「发布附件」不是「源码」。
+# 建议传到 GitHub Release 上，别塞进 git 历史（一旦提交就永远留在历史里了）。
+dist/*.whl

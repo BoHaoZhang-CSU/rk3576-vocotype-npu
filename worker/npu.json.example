@@ -1,0 +1,17 @@
+{
+  "_说明": "拷到 ~/.config/vocotype/npu.json 后按需改。文件不存在就用这里的默认值。",
+
+  "asr_model_dir": "~/.local/share/vocotype-npu/models/sherpa-onnx-rk3576-10-seconds-paraformer-zh-2023-03-28",
+  "short_audio_model_dir": "~/.local/share/vocotype-npu/models/sherpa-onnx-rk3576-5-seconds-paraformer-zh-2023-03-28",
+  "punc_model": "~/.local/share/vocotype-npu/models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12/model.onnx",
+
+  "punctuation": true,
+  "punc_threads": 4,
+
+  "short_audio_max_seconds": 4.8,
+  "window_seconds": 10.0,
+  "parallel_chunks": 2,
+
+  "_省内存": "parallel_chunks 设 1、short_audio_model_dir 设 \"\"，常驻内存从约 2.9GB 降到约 1.3GB（长音频慢 1.6×，短句慢 1.7×）。",
+  "_NPU内存是共享的": "NPU 侧内存是全系统共享的有限池（实测上限 2.2~2.6GB）。同时跑别的 RKNN 程序时，三个模型实例可能装不下，sherpa 会直接 exit(255)。这时把 parallel_chunks 设成 1 让位。"
+}

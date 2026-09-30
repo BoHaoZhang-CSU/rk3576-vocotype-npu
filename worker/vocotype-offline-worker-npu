@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""VoCoType 离线最终识别 worker 的 NPU 版（即插即用替换 vocotype-offline-worker）。
+
+协议与原版 C++ worker 完全一致（JSON-lines over stdin/stdout）：
+  启动   -> {"type":"ready","success":true,...}
+  prepare  -> {"type":"prepare","hotwords":...}
+  transcribe -> {"type":"transcribe","audio_path":...,"hotwords":...,"sampling_rate":...,"itn":...}
+  ping / stop
+
+识别用 sherpa-onnx 的 RK3576 RKNN Paraformer（跑在 NPU 上），标点用 CT-Transformer。
+模型是**固定窗口**的，所以超过窗口的音频会切成小块分别识别再拼起来。
+
+要求：需要**带 RKNN 支持的** sherpa-onnx（PyPI 上的普通版不行，没有 NPU 后端）。
+安装见本仓库的 README。**这个文件要跑在装了 sherpa-onnx 的 Python 环境里**，
+所以正常是通过 install.sh 生成的启动器调用，不是直接双击。
+
+三处优化（都是实测选出来的，别随手改）：
+  1. ASR 和标点**并行加载**：串行 4.7s -> 并行 3.2s。
+  2. 短音频用 **5 秒档**模型：同样 3.8s 音频，5 秒档 168ms vs 10 秒档 270ms。
+     10 秒档是固定形状，你说 3 秒它也按 10 秒算，短句纯浪费。
+  3. 长音频的多个块**并行跑在两个 NPU 核上**：实测 2 个 RKNN 上下文并发，
+     吞吐 1.61×（单次耗时只涨 1.25×，说明是双核而不是抢一个核）。
+     小块少的时候串行反而更好，所以只在块数 > 1 时才并行。
+
+配置：~/.config/vocotype/npu.json（可选，不存在就用下面的默认值）
+  {"asr_model_dir": ..., "short_audio_model_dir": ..., "short_audio_max_seconds": 4.8,
+   "punc_model": ..., "punctuation": true, "window_seconds": 10.0,
+   "parallel_chunks": 2, "punc_threads": 4}
+把 short_audio_model_dir 设为 "" 或 parallel_chunks 设为 1 可以关掉对应优化省内存。
+
+模型默认在 ~/.local/share/vocotype-npu/models/ 下找，找不到会退回本项目的开发目录
+（~/rknn-lab/paraformer/prebuilt/），也可以用 VOCOTYPE_NPU_MODELS_DIR 指路。
+"""
+
+import argparse
+import json
+import os
+import select
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+import sherpa_onnx
+import soundfile as sf
+
+HOME = Path.home()
+
+
+def _model_roots():
+    """模型可能放在哪几个地方，按优先级排。
+
+    install.sh 装在 ~/.local/share/vocotype-npu/models；本项目的开发机上是
+    ~/rknn-lab/paraformer/prebuilt。都找不到时返回第一个（好让报错信息有用）。
+    """
+    roots = []
+    env = os.environ.get("VOCOTYPE_NPU_MODELS_DIR", "").strip()
+    if env:
+        roots.append(Path(env))
+    roots.append(HOME / ".local" / "share" / "vocotype-npu" / "models")
+    roots.append(HOME / "rknn-lab" / "paraformer" / "prebuilt")
+    return roots
+
+
+def find_model(name):
+    """在候选目录里找模型；找不到就返回首选路径（调用方报错时能看到该放哪）。"""
+    roots = _model_roots()
+    for root in roots:
+        candidate = root / name
+        if candidate.is_dir():
+            return str(candidate)
+    return str(roots[0] / name)
+
+
+ASR_MODEL_NAME = "sherpa-onnx-rk3576-10-seconds-paraformer-zh-2023-03-28"
+SHORT_MODEL_NAME = "sherpa-onnx-rk3576-5-seconds-paraformer-zh-2023-03-28"
+PUNC_MODEL_NAME = "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12"
+
+DEFAULTS = {
+    "asr_model_dir": find_model(ASR_MODEL_NAME),
+    "short_audio_model_dir": find_model(SHORT_MODEL_NAME),
+    "short_audio_max_seconds": 4.8,
+    "punc_model": str(Path(find_model(PUNC_MODEL_NAME)) / "model.onnx"),
+    "punctuation": True,
+    "window_seconds": 10.0,
+    "parallel_chunks": 2,
+    "punc_threads": 4,
+}
+
+CONFIG_PATH = Path(os.environ.get("VOCOTYPE_NPU_CONFIG", "").strip() or
+                   HOME / ".config" / "vocotype" / "npu.json")
+
+SAMPLE_RATE = 16000
+# 窗口/短句都留 4% 余量，避免边界被截断（模型实际接受 9.99 / 4.99 秒）
+SAFE_RATIO = 0.96
+
+
+def log(message):
+    print(f"[npu-worker] {message}", file=sys.stderr, flush=True)
+
+
+def load_config():
+    config = dict(DEFAULTS)
+    if CONFIG_PATH.is_file():
+        try:
+            config.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+        except Exception as error:  # 配置写坏了不该让 worker 起不来
+            log(f"读取 {CONFIG_PATH} 失败，用默认配置：{error}")
+    for key, env in (
+        ("asr_model_dir", "VOCOTYPE_NPU_ASR_DIR"),
+        ("punc_model", "VOCOTYPE_NPU_PUNC_MODEL"),
+    ):
+        if os.environ.get(env):
+            config[key] = os.environ[env]
+    # 在配置文件里写 "~/..." 是人之常情，但 Path 不会自己展开 ~，这里补上
+    for key in ("asr_model_dir", "short_audio_model_dir", "punc_model"):
+        if config.get(key):
+            config[key] = os.path.expanduser(str(config[key]))
+    return config
+
+
+def parse_options():
+    parser = argparse.ArgumentParser(add_help=False)
+    # 这几个参数由 vocotype-core 传入，为了兼容必须接受，但本 worker 不用它们：
+    #   --asr-model-dir  是 FunASR 模型目录，NPU 版用 npu.json 里的 RKNN 模型
+    #   --vad-model-dir  同理（本 worker 用切块而不是 VAD）
+    parser.add_argument("--asr-model-dir", default="")
+    parser.add_argument("--vad-model-dir", default="")
+    parser.add_argument("--punc-model-dir", default="")
+    parser.add_argument("--threads", type=int, default=2)
+    parser.add_argument("--idle-timeout-ms", type=int, default=300000)
+    parser.add_argument("--help", action="store_true")
+    options, unknown = parser.parse_known_args()
+    if options.help:
+        print(__doc__)
+        sys.exit(0)
+    if unknown:
+        log(f"忽略未知参数：{' '.join(unknown)}")
+    options.idle_timeout_ms = max(1000, options.idle_timeout_ms)
+    return options
+
+
+def join_texts(pieces):
+    """把分段结果拼起来。中文直接接，ASCII 之间补空格免得粘成一个词。"""
+    result = ""
+    for piece in pieces:
+        piece = piece.strip()
+        if not piece:
+            continue
+        if result and result[-1].isascii() and result[-1].isalnum() \
+                and piece[0].isascii() and piece[0].isalnum():
+            result += " "
+        result += piece
+    return result
+
+
+def split_long(samples, sample_rate, max_seconds):
+    """把过长的语音段切开；在切点附近找能量最低处下刀，减少切在词中间。"""
+    limit = int(max_seconds * sample_rate)
+    frame = int(0.02 * sample_rate)
+    out = []
+    start = 0
+    while len(samples) - start > limit:
+        low = start + int(limit * 0.8)
+        high = start + limit
+        cut = high
+        window = samples[low:high]
+        usable = len(window) - len(window) % frame
+        if usable >= frame:
+            energy = np.abs(window[:usable].reshape(-1, frame)).mean(axis=1)
+            cut = low + int(np.argmin(energy)) * frame
+        if cut <= start:
+            cut = high
+        out.append(samples[start:cut])
+        start = cut
+    out.append(samples[start:])
+    return out
+
+
+def build_recognizer(model_dir):
+    model_dir = Path(model_dir)
+    tokens = model_dir / "tokens.txt"
+    for path in (model_dir / "encoder.rknn", model_dir / "predictor.rknn",
+                 model_dir / "decoder.rknn", tokens):
+        if not path.is_file():
+            raise RuntimeError(f"缺少模型文件：{path}")
+    return sherpa_onnx.OfflineRecognizer.from_paraformer(
+        paraformer=",".join(str(model_dir / name)
+                            for name in ("encoder.rknn", "predictor.rknn", "decoder.rknn")),
+        tokens=str(tokens),
+        provider="rknn",
+        num_threads=1,  # NPU 不吃这个；CPU 侧开销靠多实例并行，不靠加线程
+        debug=False,
+    )
+
+
+class Worker:
+    def __init__(self, options, config):
+        self.options = options
+        self.config = config
+        self.last_activity = time.monotonic()
+        self.hotwords = ""
+        self.lock = threading.Lock()  # 保护下面几个后台加载的模型引用
+
+        # 窗口长度和短句阈值都从配置读（模型是固定形状，说 3 秒也按 10 秒算，
+        # 所以这两个数字直接决定「切几块」和「走哪个档」）。
+        self.window_seconds = float(config.get("window_seconds") or 10.0)
+        self.safe_seconds = self.window_seconds * SAFE_RATIO
+        self.short_max_seconds = float(config.get("short_audio_max_seconds") or 4.8)
+
+        started = time.monotonic()
+        # ASR 和标点互不相干，并行加载：串行 4.7s -> 3.2s。
+        # 用字典接结果是因为闭包不能直接赋值给本地变量。
+        loaded = {}
+
+        def load_asr():
+            loaded["asr"] = build_recognizer(config["asr_model_dir"])
+            log(f"ASR 模型加载完成（{time.monotonic() - started:.1f}s）")
+
+        # 尊重 vocotype-core 的选择：没传 --punc-model-dir 说明用户在设置里关了标点
+        punc_enabled = bool(config.get("punctuation")) and bool(options.punc_model_dir)
+        punc_model = Path(config["punc_model"]) if punc_enabled else None
+
+        def load_punc():
+            if not (punc_model and punc_model.is_file()):
+                return
+            punctuation_config = sherpa_onnx.OfflinePunctuationConfig()
+            punctuation_config.model.ct_transformer = str(punc_model)
+            punctuation_config.model.num_threads = int(config["punc_threads"])
+            loaded["punc"] = sherpa_onnx.OfflinePunctuation(punctuation_config)
+            log(f"标点模型加载完成（{time.monotonic() - started:.1f}s）")
+
+        threads = [threading.Thread(target=load_asr, name="load-asr"),
+                   threading.Thread(target=load_punc, name="load-punc")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.recognizer = loaded.get("asr")
+        if self.recognizer is None:
+            raise RuntimeError(f"ASR 模型加载失败：{config['asr_model_dir']}")
+        self.punctuator = loaded.get("punc")
+        if punc_model and not punc_model.is_file():
+            log(f"标点模型不存在，跳过标点：{punc_model}")
+
+        # 短音频用的 5 秒档 + 长音频并行用的第二个 10 秒档，都在后台慢慢加载。
+        # 这样 worker 3.2 秒就能用，不为了这两个优化把冷启动拖到 9 秒。
+        # 加载完成前请求走原来的单实例串行路径，不会报错。
+        self.recognizer_short = None
+        self.recognizer_alt = None
+        self.pool = None
+        threading.Thread(target=self._warm_extra_models, name="warm-extra", daemon=True).start()
+
+    def _warm_extra_models(self):
+        """后台预加载可选模型。任何失败都只是退化成单实例，不影响主流程。"""
+        config = self.config
+        try:
+            short_dir = config.get("short_audio_model_dir") or ""
+            if short_dir and Path(short_dir).is_dir():
+                started = time.monotonic()
+                recognizer = build_recognizer(short_dir)
+                with self.lock:
+                    self.recognizer_short = recognizer
+                log(f"5 秒档模型加载完成（{time.monotonic() - started:.1f}s）")
+            elif short_dir:
+                log(f"5 秒档模型不存在，短音频继续用 10 秒档：{short_dir}")
+        except Exception as error:
+            log(f"5 秒档模型加载失败，短音频继续用 10 秒档：{error}")
+        try:
+            count = max(1, int(config.get("parallel_chunks", 1)))
+            if count > 1:
+                started = time.monotonic()
+                recognizer = build_recognizer(config["asr_model_dir"])
+                with self.lock:
+                    self.recognizer_alt = recognizer
+                    self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="npu")
+                log(f"第二个 NPU 上下文加载完成（{time.monotonic() - started:.1f}s），"
+                    f"长音频将并行解码")
+        except Exception as error:
+            log(f"第二个 NPU 上下文加载失败，长音频仍串行：{error}")
+
+    # ---------- 识别 ----------
+
+    def _decode(self, samples, recognizer):
+        stream = recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, samples)
+        recognizer.decode_stream(stream)
+        return stream.result.text
+
+    def _decode_group(self, chunks, recognizer):
+        return [self._decode(chunk, recognizer) for chunk in chunks]
+
+    def _decode_chunks(self, chunks):
+        """解码切好的块。每个 RKNN 上下文只占一个 NPU 核且不是线程安全的，
+        所以要并行就必须**每个线程一个自己的 recognizer**（也就是各自一份模型）。"""
+        with self.lock:
+            alt, pool = self.recognizer_alt, self.pool
+        if alt is None or pool is None or len(chunks) < 2:
+            return self._decode_group(chunks, self.recognizer)
+        # 对半分成两组，两个核各跑一组。组内串行，组间并行。
+        half = (len(chunks) + 1) // 2
+        groups = (chunks[:half], chunks[half:])
+        futures = [pool.submit(self._decode_group, group, recognizer)
+                   for group, recognizer in zip(groups, (self.recognizer, alt))]
+        pieces = []
+        for future in futures:
+            pieces.extend(future.result())
+        return pieces
+
+    def _usable(self, chunk):
+        if len(chunk) < int(0.25 * SAMPLE_RATE):
+            return False  # 太短，模型会输出垃圾
+        if float(np.abs(chunk).max()) < 5e-4:
+            return False  # 近似数字静音，跳过免得模型瞎编
+        return True
+
+    def transcribe_samples(self, samples):
+        if not self._usable(samples):
+            return "", 0, "整段太短或近似静音，跳过"
+
+        # 短音频走 5 秒档（前提是它已经加载好了），其余走 10 秒档。
+        # 实测：3.8 秒音频 5 秒档 168ms、10 秒档 270ms——10 秒档是固定形状，
+        # 说 3 秒也按 10 秒算，短句纯浪费。超过 5 秒则宁可单窗口跑 10 秒档，
+        # 也不切成两块（切块既慢又会在切点丢字）。
+        with self.lock:
+            short = self.recognizer_short
+        if short is not None and len(samples) <= int(self.short_max_seconds * SAMPLE_RATE):
+            text = self._decode(samples, short)
+            if self.punctuator is not None and text:
+                text = self.punctuator.add_punctuation(text)
+            return text, 1, "5 秒档"
+
+        # 长音频切块。**故意不用 VAD 切分**，实测（29 秒测试音频）：
+        #   VAD 切分          -> 「对我做了介绍什么？我想说的事呢？」（切在词中间，丢字）
+        #   直接切块（本实现） -> 「对我做了介绍啊，那么我想说的是呢，」（正确）
+        #   30 秒档整段跑      -> 前 20 秒对，尾巴全糊
+        # VAD 会把连续的句子切碎，每块各付一次窗口钱（更慢）且丢掉上下文。
+        if len(samples) <= int(self.safe_seconds * SAMPLE_RATE):
+            chunks = [samples]
+        else:
+            chunks = [chunk for chunk in split_long(samples, SAMPLE_RATE, self.safe_seconds)
+                      if self._usable(chunk)]
+        if not chunks:
+            return "", 0, "全是静音碎片，跳过"
+        text = join_texts(self._decode_chunks(chunks))
+        if self.punctuator is not None and text:
+            text = self.punctuator.add_punctuation(text)
+        with self.lock:
+            parallel = self.recognizer_alt is not None and len(chunks) > 1
+        return text, len(chunks), f"{len(chunks)} 块{'(并行)' if parallel else ''}"
+
+    # ---------- 协议 ----------
+
+    def handle(self, request):
+        kind = request.get("type", "")
+        if kind == "transcribe":
+            return self.handle_transcribe(request)
+        if kind == "prepare":
+            return self.handle_prepare(request)
+        if kind == "ping":
+            return {"success": True}
+        return {"success": False, "error": "unknown_request"}
+
+    def handle_prepare(self, request):
+        # sherpa-onnx 的离线 Paraformer 不支持热词偏置，这里只做协议兼容。
+        self.hotwords = request.get("hotwords", "")
+        return {"success": True, "prepared": True, "hotwords": self.hotwords}
+
+    def handle_transcribe(self, request):
+        audio_path = request.get("audio_path", "")
+        if not audio_path:
+            return {"success": False, "error": "audio_path is required"}
+        if not Path(audio_path).is_file():
+            return {"success": False, "error": f"audio file not found: {audio_path}"}
+
+        samples, sample_rate = sf.read(audio_path, dtype="float32", always_2d=False)
+        if samples.ndim > 1:
+            samples = samples[:, 0]
+        if sample_rate != SAMPLE_RATE:
+            # 极少数情况：不是 16k 就先线性重采样，别让模型读到错的语速
+            target = int(len(samples) * SAMPLE_RATE / sample_rate)
+            samples = np.interp(
+                np.linspace(0, len(samples) - 1, target),
+                np.arange(len(samples)), samples).astype(np.float32)
+        if samples.size == 0:
+            return {"success": False, "error": "empty_audio"}
+
+        started = time.monotonic()
+        text, chunk_count, method = self.transcribe_samples(samples)
+        latency_ms = (time.monotonic() - started) * 1000.0
+        duration = len(samples) / SAMPLE_RATE
+        log(f"{Path(audio_path).name}: {duration:.2f}s 音频 → {method}, "
+            f"{latency_ms / 1000:.2f}s, RTF {latency_ms / 1000 / max(duration, 1e-6):.3f}")
+        return {
+            "success": True,
+            "text": text,
+            "raw_text": text,
+            "latency_ms": latency_ms,
+            "snippet_time": duration,
+            "result_count": 1,
+            "hotwords": request.get("hotwords", ""),
+        }
+
+    def run(self):
+        emit({"type": "ready", "success": True, "sample_rate": SAMPLE_RATE,
+              "contextual_hotword": False,  # sherpa-onnx 离线 paraformer 不支持热词
+              "vad": False,                 # 长音频用切块而不是 VAD，见 transcribe_samples
+              "punctuation": self.punctuator is not None})
+        while True:
+            remaining = self.options.idle_timeout_ms / 1000.0 - (
+                time.monotonic() - self.last_activity)
+            if remaining <= 0:
+                return 0
+            ready, _, _ = select.select([sys.stdin], [], [], remaining)
+            if not ready:
+                return 0
+            line = sys.stdin.readline()
+            if not line:
+                return 0
+            line = line.strip()
+            if not line:
+                continue
+            self.last_activity = time.monotonic()
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError as error:
+                emit({"success": False, "error": f"invalid json: {error}"})
+                continue
+            if request.get("type") == "stop":
+                emit({"success": True})
+                return 0
+            try:
+                emit(self.handle(request))
+            except Exception as error:  # 单个请求失败不能拖垮 worker
+                emit({"success": False, "error": str(error)})
+
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    options = parse_options()
+    try:
+        worker = Worker(options, load_config())
+    except Exception as error:
+        emit({"type": "ready", "success": False, "error": str(error)})
+        log(f"启动失败：{error}")
+        return 1
+    return worker.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

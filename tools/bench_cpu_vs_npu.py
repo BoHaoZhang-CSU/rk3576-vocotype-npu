@@ -139,13 +139,19 @@ def main():
 
     # 常驻的 NPU worker 已经占着 NPU 内存了，这时再起第二个会 `failed to malloc
     # npu memory` 并且**直接 exit(255)**（sherpa 的 C++ 层硬退出，Python 的
-    # try/except 接不住）。所以 ONLY=cpu 可以单独跑 CPU 那一半。
+    # try/except 接不住）。所以 ONLY 可以把两半拆开单独跑：
+    #   ONLY=cpu  只跑 CPU（常驻 worker 在的时候用这个）
+    #   ONLY=npu  只跑 NPU
+    #   不设     两边轮流跑，打对比表
     only = os.environ.get("ONLY", "").lower()
+    if only not in ("", "cpu", "npu"):
+        print(f"ONLY 只能是 cpu 或 npu，不认识 {only!r}", file=sys.stderr)
+        return 2
+
     threads = 4
-    if only != "npu":
+    cpu_results = None
+    if only in ("", "cpu"):
         cpu_results = measure(f"CPU {threads} 线程", CPU_WORKER, threads, wavs, 3)
-    else:
-        return 0
     if only == "cpu":
         print(f"{'音频':>8}  {'耗时':>9} {'CPU时间':>10}  RTF")
         for wav in wavs:
@@ -154,7 +160,17 @@ def main():
             print(f"{duration:6.1f}s  {wall * 1000:8.0f}ms {cpu * 1000:9.0f}ms  "
                   f"{wall / duration:.3f}   {text[:40]}")
         return 0
+
     npu_results = measure("NPU", NPU_WORKER, threads, wavs, 25)
+
+    if only == "npu":
+        print(f"{'音频':>8}  {'耗时':>9} {'CPU时间':>10}  RTF")
+        for wav in wavs:
+            text, wall, cpu = npu_results[wav]
+            duration = sf.info(wav).duration
+            print(f"{duration:6.1f}s  {wall * 1000:8.0f}ms {cpu * 1000:9.0f}ms  "
+                  f"{wall / duration:.3f}   {text[:40]}")
+        return 0
 
     print(f"{'音频':>8}  {'CPU 4线程':>22}  {'NPU':>22}   加速比")
     print(f"{'':>8}  {'耗时':>9} {'CPU时间':>10}  {'耗时':>9} {'CPU时间':>10}")

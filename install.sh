@@ -46,7 +46,7 @@ while [ $# -gt 0 ]; do
         --revert)       MODE=revert ;;
         --no-config)    DO_CONFIG=0 ;;
         --build-sherpa) DO_BUILD_SHERPA=1 ;;
-        -h|--help)      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)      sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)              die "不认识的参数：$1" ;;
     esac
     shift
@@ -103,10 +103,20 @@ if [ "$MODE" = check ]; then
         fi
     done
     [ -f "$NPU_CONFIG" ] && say "  npu.json：有" || say "  npu.json：没有（用默认值）"
-    if [ -f "$VOCO_CONFIG" ] && grep -q '"worker_path"' "$VOCO_CONFIG"; then
-        say "  VocoType worker_path：$(python3 -c "import json;print(json.load(open('$VOCO_CONFIG'))['asr']['worker_path'])")"
+    # 注意别用 grep 找 "worker_path"：asr_streaming 段里也有同名的键，
+    # 而且 asr 段里没有这个键时直接下标会 KeyError。交给 python 判。
+    if [ -f "$VOCO_CONFIG" ]; then
+        say "  VocoType worker_path：$(python3 - "$VOCO_CONFIG" <<'PY'
+import json, sys
+try:
+    asr = json.load(open(sys.argv[1])).get("asr") or {}
+    print(asr.get("worker_path") or "没设（用原版 CPU worker）")
+except Exception as error:
+    print(f"（读不出来：{error}）")
+PY
+)"
     else
-        say "  VocoType worker_path：没设（用原版 CPU worker）"
+        say "  VocoType worker_path：找不到配置，无从判断"
     fi
     exit 0
 fi
@@ -116,7 +126,14 @@ fi
 if [ "$MODE" = revert ]; then
     step "把 VocoType 换回原来的 CPU worker"
     [ -f "$VOCO_CONFIG" ] || die "没有 $VOCO_CONFIG"
-    cp -a "$VOCO_CONFIG" "$VOCO_CONFIG.bak-npu"
+    [ "$DO_CONFIG" = 1 ] || die "--revert 与 --no-config 不能同用（前者本来就要改配置）"
+    # 只在没有备份时备份。否则第二次跑会拿「已经改过的」配置盖掉原始备份，
+    # 用户原来的 worker_path 就永久没了。
+    if [ -f "$VOCO_CONFIG.bak-npu" ]; then
+        say "  已有备份 $VOCO_CONFIG.bak-npu，保留它不覆盖"
+    else
+        cp -a "$VOCO_CONFIG" "$VOCO_CONFIG.bak-npu"
+    fi
     python3 - "$VOCO_CONFIG" <<'PY'
 import json, sys
 path = sys.argv[1]
@@ -130,7 +147,8 @@ PY
     else
         warn "重启 $UNIT 失败，手动跑：systemctl --user restart $UNIT"
     fi
-    say "\n完成。现在用的是 VocoType 自带的 CPU worker，速度和以前一样。"
+    say ""
+    say "完成。现在用的是 VocoType 自带的 CPU worker，速度和以前一样。"
     say "NPU 那套东西还在，想换回来再跑一次 ./install.sh 就行。"
     exit 0
 fi
@@ -269,7 +287,12 @@ if [ "$DO_CONFIG" = 0 ]; then
 else
     step "接进 VocoType"
     [ -f "$VOCO_CONFIG" ] || die "没有 $VOCO_CONFIG，先用 --no-config 装环境，或确认 VocoType 装好了"
-    cp -a "$VOCO_CONFIG" "$VOCO_CONFIG.bak-npu"
+    # 只在没有备份时备份，保住「最初的原始配置」（第二次跑不该把它盖掉）
+    if [ -f "$VOCO_CONFIG.bak-npu" ]; then
+        say "  已有备份 $VOCO_CONFIG.bak-npu，保留它不覆盖"
+    else
+        cp -a "$VOCO_CONFIG" "$VOCO_CONFIG.bak-npu"
+    fi
     python3 - "$VOCO_CONFIG" "$LAUNCHER" <<'PY'
 import json, sys
 path, worker = sys.argv[1], sys.argv[2]
@@ -284,7 +307,7 @@ json.dump(cfg, open(path, "w"), ensure_ascii=False, indent=2)
 PY
     say "  asr.worker_path = $LAUNCHER"
     say "  asr.idle_timeout_s = 3600（原默认 300 秒太短，会反复重新加载模型）"
-    say "  原配置备份：$VOCO_CONFIG.bak-npu"
+    say "  原配置备份：$VOCO_CONFIG.bak-npu（只备份一次，重复跑不会盖掉最初的）"
 fi
 
 # ---------------------------------------------------------------- 冒烟测试
@@ -317,8 +340,10 @@ cat <<EOF
 
 完成。
 
-  现在按一下 F9 就能说话（再按一下结束）。第一次说完会等 3～4 秒加载模型，
-  之后就快了。
+  现在按住 F9 说话、松开上屏。第一次说完会等 3～4 秒加载模型，之后就快了。
+
+  （想改成「按一下开始、再按一下结束」要另外打个补丁，见 patches/README.md。
+    那是改 VocoType 源码，不是配置。没打之前热键仍是按住说话。）
 
   改参数        $NPU_CONFIG（改完 systemctl --user restart $UNIT）
   换回 CPU      ./install.sh --revert

@@ -95,6 +95,9 @@ CONFIG_PATH = Path(os.environ.get("VOCOTYPE_NPU_CONFIG", "").strip() or
 SAMPLE_RATE = 16000
 # 窗口/短句都留 4% 余量，避免边界被截断（模型实际接受 9.99 / 4.99 秒）
 SAFE_RATIO = 0.96
+# 上面这个 4% 是按「窗口 10 秒 / 短句 5 秒」算的。模型的硬上限是 4.99 秒，
+# 所以 short_audio_max_seconds 配到 4.99 就到头了 —— 再大这个 0.96 系数
+# 反而会把阈值顶到 4.99 以上，短句会被截断。默认 4.8 是安全值。
 
 
 def log(message):

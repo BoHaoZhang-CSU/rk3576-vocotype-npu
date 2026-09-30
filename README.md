@@ -60,7 +60,7 @@ export VOCOTYPE_NPU_WHEEL=dist/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_a
 ./install.sh
 ```
 
-装完按 F9 说话就行。脚本会做这些事：
+装完**按住 F9 说话、松开上屏**。脚本会做这些事：
 
 1. 体检（aarch64、NPU 在不在）
 2. 在仓库里建 `.venv`，装 numpy / soundfile / sherpa-onnx
@@ -82,6 +82,8 @@ export VOCOTYPE_NPU_WHEEL=dist/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_a
 ### 前置条件
 
 - **aarch64 的 Rockchip 板子，带 NPU**（只在 RK3576 / ROCK 4D 上实测过）
+- **Python 3.11**（`dist/` 里那个轮子是 `cp311` 的。系统 python3 是别的版本时，
+  建 venv 会成功、装轮子才报错，所以先说清楚）
 - VocoType 已经装好并且能用（它自己那套 CPU 识别要先跑通）
 - Radxa 镜像自带的 `rknpu2-rk3588` 包（提供 `/usr/include/rknn_api.h` 和
   `/usr/lib/librknnrt.so`，编译 sherpa-onnx 要用）
@@ -160,7 +162,8 @@ VocoType 核心 ──JSON-lines──> vocotype-offline-worker-npu ──> sher
 3. **长音频的块并行跑在两个 NPU 核上**：RK3576 是**双核** NPU（实测开 2 个
    RKNN 上下文，单次只慢 1.25×，吞吐到 1.61×；开 3 个只到 1.73×，第三个核没收益）。
 
-两个可选模型在**后台线程**加载，所以 worker 3.5 秒就能用；加载完之前自动走单实例串行。
+ASR 和标点是**并行**加载的（3.2 s，都在 ready 之前）；5 秒档模型和第二个 10 秒档
+实例则在**后台线程**慢慢加载，worker 3.5 秒就能用，加载完之前自动走单实例串行路径。
 
 **试过但没收益的（别再试一遍）**：内存搬运/零拷贝（CPU/墙钟 = 0.23，CPU 77% 的时间
 在等 NPU，数据早搬完了）、int8 量化（官方模型已经是 int8）、标点搬到 NPU（只占
@@ -180,13 +183,18 @@ VocoType 核心 ──JSON-lines──> vocotype-offline-worker-npu ──> sher
 | `punc_model` | CT-Transformer | 标点模型路径 |
 | `punctuation` | `true` | 总开关（VocoType 关标点时也会关） |
 | `window_seconds` | 10.0 | 主模型的固定窗口 |
-| `parallel_chunks` | 2 | 长音频并行块数。设 `1` 省 440 MB NPU 内存 |
+| `parallel_chunks` | 2 | 其实是**开关**（见下）。设 `1` 省 440 MB NPU 内存 |
 | `punc_threads` | 4 | 标点用的 CPU 线程数 |
 
 改完要 `systemctl --user restart vocotype-fcitx5-backend.service`。
 
+> `parallel_chunks` 名义上是「并行块数」，但代码里 **>1 都等价**：只多建一个
+> recognizer，线程池固定 2 路。设 3 或 4 跟设 2 完全一样（也不多占内存）。
+> 因为 RK3576 就两个 NPU 核，第三个核实测没有额外收益。
+
 **想省内存**（2.93 GB → 约 1.3 GB）：`"parallel_chunks": 1` +
-`"short_audio_model_dir": ""`。这是初版的行为，长音频慢 1.6×、短句慢 1.7×。
+`"short_audio_model_dir": ""`。这是初版的行为，长音频慢约 1.74×（端到端实测）、
+短句慢 1.61～1.75×。
 
 ### NPU 侧内存是**跨进程共享**的有限池
 
@@ -284,7 +292,15 @@ vocotype-npu/
 ├── patches/
 │   ├── 0001-fcitx5-toggle-hotkey.patch  可选：F9 改成按一下切换
 │   └── README.md
-└── docs/                         实测数据、踩坑记录、生态调研、视频素材
+├── dist/
+│   ├── README.md                 轮子的适用条件和来历
+│   └── sherpa_onnx-*.whl         预编译的带 RKNN 的 sherpa-onnx（15 MB，不入库）
+└── docs/
+    ├── 01-实测数据.md             所有性能数字和测量方法
+    ├── 02-踩坑记录.md             踩过的坑，按「什么时候会绊倒你」分组
+    ├── 03-生态调研.md             这件事有没有人做过、值不值得发
+    ├── 04-视频脚本素材.md         分镜、台词、要打的数字
+    └── 05-发布清单.md             提交到代码仓库前的检查
 ```
 
 ---

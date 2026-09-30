@@ -52,13 +52,17 @@
 ## 快速开始
 
 ```bash
-git clone <这个仓库> && cd vocotype-npu
+git clone git@github.com:BoHaoZhang-CSU/rk3576-vocotype-npu.git
+cd rk3576-vocotype-npu
 
-# 有 dist/ 里那个预编译轮子的话，加上这一行能省 25 分钟编译
-export VOCOTYPE_NPU_WHEEL=dist/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_aarch64.whl
+# 加上这一行能省 25 分钟编译（轮子没跟代码走，挂在 Releases 上）
+export VOCOTYPE_NPU_WHEEL=https://github.com/BoHaoZhang-CSU/rk3576-vocotype-npu/releases/download/v1.0.0/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_aarch64.whl
 
 ./install.sh
 ```
+
+不便连 GitHub 的话，把轮子下载好放进 `dist/`，`install.sh` 会自己发现它；
+或者 `export VOCOTYPE_NPU_WHEEL=/本地路径/sherpa_onnx-....whl`。
 
 装完**按住 F9 说话、松开上屏**。脚本会做这些事：
 
@@ -110,7 +114,7 @@ VOCOTYPE_NPU_WHEEL=/path/to/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_aarc
     ./install.sh
 
 # 或者一个网址（会下载并缓存到 ~/.cache/vocotype-npu/）
-VOCOTYPE_NPU_WHEEL=https://github.com/<用户名>/vocotype-npu/releases/download/v1.0.0/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_aarch64.whl \
+VOCOTYPE_NPU_WHEEL=https://github.com/BoHaoZhang-CSU/rk3576-vocotype-npu/releases/download/v1.0.0/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_aarch64.whl \
     ./install.sh
 ```
 

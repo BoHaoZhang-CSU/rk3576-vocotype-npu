@@ -20,7 +20,7 @@ VOCOTYPE_NPU_WHEEL=/path/to/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_aarc
 **直接给一个网址**（它会自己下，缓存到 `~/.cache/vocotype-npu/`）：
 
 ```bash
-VOCOTYPE_NPU_WHEEL=https://github.com/<你>/vocotype-npu/releases/download/v1.0.0/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_aarch64.whl \
+VOCOTYPE_NPU_WHEEL=https://github.com/BoHaoZhang-CSU/rk3576-vocotype-npu/releases/download/v1.0.0/sherpa_onnx-1.13.8-1-cp311-cp311-manylinux_2_27_aarch64.whl \
     ./install.sh
 ```
 
